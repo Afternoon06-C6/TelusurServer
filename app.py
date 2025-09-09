@@ -22,7 +22,6 @@ UPLOAD_FOLDER = BASE_DIR / "Uploads"
 PROCESSED_FOLDER = BASE_DIR / "Processed"
 
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
-CHOSEN_COLOR = "blue"
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -44,7 +43,7 @@ except Exception as e:
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def process_video_with_yolo(input_path, output_path):
+def process_video_with_yolo(input_path, output_path, chosen_color):
     """Process video with YOLO detection and save with bounding boxes using two-stage detection pipeline"""
     if model is None or tshirt_model is None:
         raise Exception("YOLO or t-shirt model not loaded")
@@ -129,7 +128,7 @@ def process_video_with_yolo(input_path, output_path):
                             conf = float(tshirt_box.conf[0]) if hasattr(tshirt_box, "conf") else 0.0
                             label = tshirt_model.names[int(tshirt_box.cls[0])] if hasattr(tshirt_box, "cls") else "tshirt"
 
-                            if label.lower() == CHOSEN_COLOR.lower():
+                            if label.lower() == chosen_color.lower():
                                 last_detections.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
 
             last_annotated_frame = annotated_frame.copy()
@@ -163,22 +162,31 @@ def upload_videos():
     if "videos" not in request.files:
         return jsonify({"error": "No videos provided"}), 400
 
+    # Read uuid and topColor from request.form
+    request_uuid = request.form.get("uuid")
+    top_color = request.form.get("topColor")
+
+    if not request_uuid:
+        return jsonify({"error": "UUID not provided"}), 400
+    if not top_color:
+        return jsonify({"error": "topColor not provided"}), 400
+
     files = request.files.getlist("videos")
     threads = []
     results = []
 
-    def process_file(file, unique_id, original_filename, input_path, output_path):
+    def process_file(file, uuid_str, original_filename, input_path, output_path, chosen_color):
         try:
             # Save uploaded file
             file.save(input_path)
 
             # Process with YOLO
-            process_video_with_yolo(input_path, output_path)
+            process_video_with_yolo(input_path, output_path, chosen_color)
 
             results.append(
                 {
                     "original_name": original_filename,
-                    "processed_id": unique_id,
+                    "processed_id": uuid_str,
                     "processed_filename": os.path.basename(output_path),
                 }
             )
@@ -191,15 +199,14 @@ def upload_videos():
 
     for file in files:
         if file and file.filename and allowed_file(file.filename):
-            unique_id = str(uuid.uuid4())
             original_filename = secure_filename(file.filename)
-            input_filename = f"{unique_id}_{original_filename}"
-            output_filename = f"processed_{unique_id}_{original_filename}"
+            input_filename = f"{request_uuid}_{original_filename}"
+            output_filename = f"processed_{request_uuid}_{original_filename}"
 
             input_path = os.path.join(UPLOAD_FOLDER, input_filename)
             output_path = os.path.join(PROCESSED_FOLDER, output_filename)
 
-            t = threading.Thread(target=process_file, args=(file, unique_id, original_filename, input_path, output_path))
+            t = threading.Thread(target=process_file, args=(file, request_uuid, original_filename, input_path, output_path, top_color))
             t.start()
             threads.append(t)
 
