@@ -2,4 +2,4 @@
 python = "3.13"
 
 [env]
-_.python.venv = ".venv" # relative to this file's directory
+_.python.venv = { path = ".venv", create = true } # create the venv if it doesn't exist
