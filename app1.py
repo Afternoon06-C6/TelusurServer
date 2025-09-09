@@ -14,9 +14,12 @@ CORS(app)
 
 # Configuration
 APP_NAME = "Telusur"
+PORT=4789
+
 BASE_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
-UPLOAD_FOLDER = BASE_DIR / 'uploads'
-PROCESSED_FOLDER = BASE_DIR / 'processed'
+UPLOAD_FOLDER = BASE_DIR / 'Uploads'
+PROCESSED_FOLDER = BASE_DIR / 'Processed'
+
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
 PORT=4789
 
