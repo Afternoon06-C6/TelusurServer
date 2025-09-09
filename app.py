@@ -8,6 +8,7 @@ import uuid
 from werkzeug.utils import secure_filename
 import os
 from pathlib import Path
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -21,6 +22,7 @@ UPLOAD_FOLDER = BASE_DIR / "Uploads"
 PROCESSED_FOLDER = BASE_DIR / "Processed"
 
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
+CHOSEN_COLOR = "blue"
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -28,7 +30,7 @@ os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
 # Analysis interval for frame processing: set to 1 to analyze every frame,
 # or increase to 5, 10, etc. to analyze every Nth frame for faster processing.
-ANALYSIS_INTERVAL = 5
+ANALYSIS_INTERVAL = 15
 
 # Load YOLO model
 try:
@@ -127,7 +129,8 @@ def process_video_with_yolo(input_path, output_path):
                             conf = float(tshirt_box.conf[0]) if hasattr(tshirt_box, "conf") else 0.0
                             label = tshirt_model.names[int(tshirt_box.cls[0])] if hasattr(tshirt_box, "cls") else "tshirt"
 
-                            last_detections.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
+                            if label.lower() == CHOSEN_COLOR.lower():
+                                last_detections.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
 
             last_annotated_frame = annotated_frame.copy()
         else:
@@ -161,45 +164,50 @@ def upload_videos():
         return jsonify({"error": "No videos provided"}), 400
 
     files = request.files.getlist("videos")
-    processed_files = []
+    threads = []
+    results = []
+
+    def process_file(file, unique_id, original_filename, input_path, output_path):
+        try:
+            # Save uploaded file
+            file.save(input_path)
+
+            # Process with YOLO
+            process_video_with_yolo(input_path, output_path)
+
+            results.append(
+                {
+                    "original_name": original_filename,
+                    "processed_id": unique_id,
+                    "processed_filename": os.path.basename(output_path),
+                }
+            )
+
+            # Clean up input file
+            os.remove(input_path)
+
+        except Exception as e:
+            results.append({"error": f"Error processing {file.filename}: {str(e)}"})
 
     for file in files:
         if file and file.filename and allowed_file(file.filename):
-            try:
-                # Generate unique filename
-                unique_id = str(uuid.uuid4())
-                original_filename = secure_filename(file.filename)
-                input_filename = f"{unique_id}_{original_filename}"
-                output_filename = f"processed_{unique_id}_{original_filename}"
+            unique_id = str(uuid.uuid4())
+            original_filename = secure_filename(file.filename)
+            input_filename = f"{unique_id}_{original_filename}"
+            output_filename = f"processed_{unique_id}_{original_filename}"
 
-                input_path = os.path.join(UPLOAD_FOLDER, input_filename)
-                output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+            input_path = os.path.join(UPLOAD_FOLDER, input_filename)
+            output_path = os.path.join(PROCESSED_FOLDER, output_filename)
 
-                # Save uploaded file
-                file.save(input_path)
+            t = threading.Thread(target=process_file, args=(file, unique_id, original_filename, input_path, output_path))
+            t.start()
+            threads.append(t)
 
-                # Process with YOLO
-                process_video_with_yolo(input_path, output_path)
-
-                processed_files.append(
-                    {
-                        "original_name": original_filename,
-                        "processed_id": unique_id,
-                        "processed_filename": output_filename,
-                    }
-                )
-
-                # Clean up input file
-                os.remove(input_path)
-
-            except Exception as e:
-                return (
-                    jsonify({"error": f"Error processing {file.filename}: {str(e)}"}),
-                    500,
-                )
+    for t in threads:
+        t.join()
 
     return jsonify(
-        {"message": "Videos processed successfully", "processed_files": processed_files}
+        {"message": "Videos processed successfully", "processed_files": results}
     )
 
 
