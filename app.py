@@ -20,16 +20,20 @@ PORT = 4789
 BASE_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 UPLOAD_FOLDER = BASE_DIR / "Uploads"
 PROCESSED_FOLDER = BASE_DIR / "Processed"
+IMAGES_FOLDER = BASE_DIR / "Images"
 
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+os.makedirs(IMAGES_FOLDER, exist_ok=True)
 
 # Analysis interval for frame processing: set to 1 to analyze every frame,
 # or increase to 5, 10, etc. to analyze every Nth frame for faster processing.
 ANALYSIS_INTERVAL = 15
+IOU_THRESHOLD = 0.3
+MAX_MISSED = 3
 
 # Load YOLO model
 try:
@@ -43,12 +47,48 @@ except Exception as e:
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def process_video_with_yolo(input_path, output_path, chosen_color):
+def compute_iou(boxA, boxB):
+    # box: (x1, y1, x2, y2)
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interWidth = max(0, xB - xA + 1)
+    interHeight = max(0, yB - yA + 1)
+    interArea = interWidth * interHeight
+
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+
+    iou = interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0
+
+    return iou
+
+def save_crop_at_frame(video_path, bbox, frame_num, output_path):
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num - 1)
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        return False
+    x1, y1, x2, y2 = bbox
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        cap.release()
+        return False
+    cv2.imwrite(output_path, crop)
+    cap.release()
+    return True
+
+def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None, original_filename=None):
     """Process video with YOLO detection and save with bounding boxes using two-stage detection pipeline"""
     if model is None or tshirt_model is None:
         raise Exception("YOLO or t-shirt model not loaded")
 
     cap = cv2.VideoCapture(input_path)
+
+    image_files = []
 
     # Get video properties
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -64,6 +104,13 @@ def process_video_with_yolo(input_path, output_path, chosen_color):
     last_annotated_frame = None
     last_detections = []
 
+    active_tracks = {}
+    finished_tracks = []
+    next_track_id = 0
+
+    # current_detections contains detections to draw for non-analysis frames
+    current_detections = []
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -71,6 +118,11 @@ def process_video_with_yolo(input_path, output_path, chosen_color):
 
         frame_count += 1
         annotated_frame = frame.copy()
+
+        updated_track_ids = set()
+
+        # By default keep previous detections for drawing when not analyzing
+        detections_for_matching = []
 
         if frame_count % ANALYSIS_INTERVAL == 0:
             # Clear last detections
@@ -102,6 +154,15 @@ def process_video_with_yolo(input_path, output_path, chosen_color):
                         x1, y1, x2, y2 = [int(b) for b in box[:4]]
 
                     # Crop ROI for the detected person
+                    # clamp coordinates to frame to avoid empty rois
+                    x1 = max(0, min(width - 1, x1))
+                    y1 = max(0, min(height - 1, y1))
+                    x2 = max(0, min(width - 1, x2))
+                    y2 = max(0, min(height - 1, y2))
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
                     roi = frame[y1:y2, x1:x2]
                     if roi.size == 0:
                         continue
@@ -124,20 +185,96 @@ def process_video_with_yolo(input_path, output_path, chosen_color):
                             abs_x2 = x1 + tx2
                             abs_y2 = y1 + ty2
 
+                            # Clamp to frame bounds
+                            abs_x1 = max(0, min(width - 1, abs_x1))
+                            abs_y1 = max(0, min(height - 1, abs_y1))
+                            abs_x2 = max(0, min(width - 1, abs_x2))
+                            abs_y2 = max(0, min(height - 1, abs_y2))
+
                             # Get confidence and label
                             conf = float(tshirt_box.conf[0]) if hasattr(tshirt_box, "conf") else 0.0
                             label = tshirt_model.names[int(tshirt_box.cls[0])] if hasattr(tshirt_box, "cls") else "tshirt"
 
                             if label.lower() == chosen_color.lower():
-                                last_detections.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
+                                detections_for_matching.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
+
+            # If we have detections, update matching; otherwise we'll just age tracks
+            if len(detections_for_matching) > 0:
+                # Match detections to active tracks using IoU
+                for det in detections_for_matching:
+                    x1, y1, x2, y2, label, conf = det
+                    matched_track_id = None
+                    max_iou = 0.0
+                    for tid, track in list(active_tracks.items()):
+                        iou = compute_iou(track['bbox'], (x1, y1, x2, y2))
+                        if iou > IOU_THRESHOLD and iou > max_iou:
+                            max_iou = iou
+                            matched_track_id = tid
+                    if matched_track_id is not None:
+                        # Update existing track
+                        active_tracks[matched_track_id]['bbox'] = (x1, y1, x2, y2)
+                        active_tracks[matched_track_id]['last_frame'] = frame_count
+                        active_tracks[matched_track_id]['missed'] = 0
+                        updated_track_ids.add(matched_track_id)
+                    else:
+                        # Create new track
+                        active_tracks[next_track_id] = {
+                            'bbox': (x1, y1, x2, y2),
+                            'start_frame': frame_count,
+                            'last_frame': frame_count,
+                            'label': label,
+                            'missed': 0,
+                            'saved': False,
+                        }
+                        updated_track_ids.add(next_track_id)
+                        next_track_id += 1
+
+            # Age tracks that were not updated in this analysis frame
+            for tid, track in list(active_tracks.items()):
+                if tid not in updated_track_ids:
+                    track['missed'] = track.get('missed', 0) + 1
+
+            # Determine ended tracks (missed too many analysis cycles)
+            ended_track_ids = [tid for tid, track in active_tracks.items() if track.get('missed', 0) > MAX_MISSED]
+            for tid in ended_track_ids:
+                track = active_tracks[tid]
+                # Save images only once per track
+                if uuid_str is not None and original_filename is not None and not track.get('saved', False):
+                    start_time = track['start_frame'] / fps
+                    end_time = track['last_frame'] / fps
+                    # Format times for filename (replace '.' with '_')
+                    start_time_str = str(round(start_time, 2)).replace('.', '_')
+                    end_time_str = str(round(end_time, 2)).replace('.', '_')
+                    start_img_name = f"{uuid_str}_{original_filename}_{tid}_{start_time_str}_startFrame.jpg"
+                    end_img_name = f"{uuid_str}_{original_filename}_{tid}_{end_time_str}_endFrame.jpg"
+                    start_img_path = os.path.join(IMAGES_FOLDER, start_img_name)
+                    end_img_path = os.path.join(IMAGES_FOLDER, end_img_name)
+                    # Check and create crops only if not existing
+                    if not os.path.exists(start_img_path):
+                        save_crop_at_frame(input_path, track['bbox'], track['start_frame'], start_img_path)
+                    if not os.path.exists(end_img_path):
+                        save_crop_at_frame(input_path, track['bbox'], track['last_frame'], end_img_path)
+                    track['saved'] = True
+                    image_files.append({
+                        "start": start_img_name,
+                        "end": end_img_name,
+                        "start_time": start_time,
+                        "end_time": end_time
+                    })
+                finished_tracks.append(track)
+                del active_tracks[tid]
+
+            # store current detections for drawing on non-analysis frames
+            current_detections = detections_for_matching.copy()
 
             last_annotated_frame = annotated_frame.copy()
         else:
+            # Not an analysis frame: keep previous annotated frame but still draw last known detections if any
             if last_annotated_frame is not None:
                 annotated_frame = frame.copy()
 
         # Draw all detections on annotated_frame
-        for (x1, y1, x2, y2, label, conf) in last_detections:
+        for (x1, y1, x2, y2, label, conf) in current_detections:  # type: ignore
             color = (0, 255, 0)
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
             text = f"{label} {conf:.2f}"
@@ -150,10 +287,34 @@ def process_video_with_yolo(input_path, output_path, chosen_color):
 
         print(f"Processing frame {frame_count}/{total_frames}")
 
+    # Finalize remaining active tracks at end of video
+    for tid, track in active_tracks.items():
+        if uuid_str is not None and original_filename is not None and not track.get('saved', False):
+            start_time = track['start_frame'] / fps
+            end_time = track['last_frame'] / fps
+            start_time_str = str(round(start_time, 2)).replace('.', '_')
+            end_time_str = str(round(end_time, 2)).replace('.', '_')
+            start_img_name = f"{uuid_str}_{original_filename}_{tid}_{start_time_str}_startFrame.jpg"
+            end_img_name = f"{uuid_str}_{original_filename}_{tid}_{end_time_str}_endFrame.jpg"
+            start_img_path = os.path.join(IMAGES_FOLDER, start_img_name)
+            end_img_path = os.path.join(IMAGES_FOLDER, end_img_name)
+            if not os.path.exists(start_img_path):
+                save_crop_at_frame(input_path, track['bbox'], track['start_frame'], start_img_path)
+            if not os.path.exists(end_img_path):
+                save_crop_at_frame(input_path, track['bbox'], track['last_frame'], end_img_path)
+            track['saved'] = True
+            image_files.append({
+                "start": start_img_name,
+                "end": end_img_name,
+                "start_time": start_time,
+                "end_time": end_time
+            })
+        finished_tracks.append(track)
+
     cap.release()
     out.release()
 
-    return True
+    return image_files
 
 
 @app.route("/upload", methods=["POST"])
@@ -181,13 +342,14 @@ def upload_videos():
             file.save(input_path)
 
             # Process with YOLO
-            process_video_with_yolo(input_path, output_path, chosen_color)
+            image_files = process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=uuid_str, original_filename=original_filename)
 
             results.append(
                 {
                     "original_name": original_filename,
                     "processed_id": uuid_str,
                     "processed_filename": os.path.basename(output_path),
+                    "images": image_files,
                 }
             )
 
