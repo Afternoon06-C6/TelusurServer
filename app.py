@@ -9,6 +9,8 @@ from werkzeug.utils import secure_filename
 import os
 from pathlib import Path
 import threading
+from PIL import ImageFont, ImageDraw, Image
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
@@ -273,14 +275,36 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
             if last_annotated_frame is not None:
                 annotated_frame = frame.copy()
 
-        # Draw all detections on annotated_frame
-        for (x1, y1, x2, y2, label, conf) in current_detections:  # type: ignore
-            color = (0, 255, 0)
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            text = f"{label} {conf:.2f}"
-            (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_frame, (x1, y1 - text_height - baseline), (x1 + text_width, y1), color, -1)
-            cv2.putText(annotated_frame, text, (x1, y1 - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        # Draw all detections on annotated_frame using Pillow for SF Pro text and fixed bounding box colors
+        if current_detections:
+            # Define color mapping
+            color_map = {
+                "black": (0, 0, 0),
+                "blue": (0, 102, 204),
+                "grey": (128, 128, 128),
+                "white": (255, 255, 255),
+            }
+            color = color_map.get(chosen_color.lower(), (255, 0, 0))
+            # Convert OpenCV image (BGR) to PIL image (RGB)
+            pil_img = Image.fromarray(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            try:
+                font = ImageFont.truetype("SF-Pro-Text-Regular.otf", 18)
+            except Exception:
+                font = ImageFont.load_default()
+            for (x1, y1, x2, y2, label, conf) in current_detections:
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+                text = f"{label} {conf:.2f}"
+                text_size = draw.textbbox((0, 0), text, font=font)
+                text_width = text_size[2] - text_size[0]
+                text_height = text_size[3] - text_size[1]
+                # Draw filled rectangle for text background with more margin from box
+                draw.rectangle([x1, y1 - text_height - 8, x1 + text_width + 4, y1], fill=color)
+                # Draw text in white (or black if box color is white)
+                text_fill = (0, 0, 0) if color == (255, 255, 255) else (255, 255, 255)
+                draw.text((x1 + 2, y1 - text_height - 6), text, font=font, fill=text_fill)
+            # Convert back to OpenCV image (BGR)
+            annotated_frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
         # Write frame
         out.write(annotated_frame)
@@ -379,28 +403,11 @@ def upload_videos():
         {"message": "Videos processed successfully", "processed_files": results}
     )
 
-
-@app.route("/video/<video_id>")
-def get_processed_video(video_id):
-    """Serve processed video file"""
-    try:
-        # Find the video file with the given ID
-        for filename in os.listdir(PROCESSED_FOLDER):
-            if video_id in filename:
-                video_path = os.path.join(PROCESSED_FOLDER, filename)
-                return send_file(video_path, mimetype="video/mp4")
-
-        return jsonify({"error": "Video not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/health")
 def health_check():
     """Health check endpoint"""
     model_status = "loaded" if model is not None else "not loaded"
     return jsonify({"status": "healthy", "yolo_model": model_status})
-
 
 if __name__ == "__main__":
     print("Starting Flask server...")
