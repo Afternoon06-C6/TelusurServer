@@ -217,9 +217,11 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
                         active_tracks[matched_track_id]['bbox'] = (x1, y1, x2, y2)
                         active_tracks[matched_track_id]['last_frame'] = frame_count
                         active_tracks[matched_track_id]['missed'] = 0
+                        # Update the end_bbox to the latest bbox
+                        active_tracks[matched_track_id]['end_bbox'] = (x1, y1, x2, y2)
                         updated_track_ids.add(matched_track_id)
                     else:
-                        # Create new track
+                        # Create new track, add start_bbox and end_bbox
                         active_tracks[next_track_id] = {
                             'bbox': (x1, y1, x2, y2),
                             'start_frame': frame_count,
@@ -227,6 +229,8 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
                             'label': label,
                             'missed': 0,
                             'saved': False,
+                            'start_bbox': (x1, y1, x2, y2),
+                            'end_bbox': (x1, y1, x2, y2),
                         }
                         updated_track_ids.add(next_track_id)
                         next_track_id += 1
@@ -251,11 +255,11 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
                     end_img_name = f"{uuid_str}_{original_filename}_{tid}_{end_time_str}_endFrame.jpg"
                     start_img_path = os.path.join(IMAGES_FOLDER, start_img_name)
                     end_img_path = os.path.join(IMAGES_FOLDER, end_img_name)
-                    # Check and create crops only if not existing
+                    # Use start_bbox and end_bbox for crops
                     if not os.path.exists(start_img_path):
-                        save_crop_at_frame(input_path, track['bbox'], track['start_frame'], start_img_path)
+                        save_crop_at_frame(input_path, track.get('start_bbox', track['bbox']), track['start_frame'], start_img_path)
                     if not os.path.exists(end_img_path):
-                        save_crop_at_frame(input_path, track['bbox'], track['last_frame'], end_img_path)
+                        save_crop_at_frame(input_path, track.get('end_bbox', track['bbox']), track['last_frame'], end_img_path)
                     track['saved'] = True
                     image_files.append({
                         "start": start_img_name,
@@ -322,10 +326,11 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
             end_img_name = f"{uuid_str}_{original_filename}_{tid}_{end_time_str}_endFrame.jpg"
             start_img_path = os.path.join(IMAGES_FOLDER, start_img_name)
             end_img_path = os.path.join(IMAGES_FOLDER, end_img_name)
+            # Use start_bbox and end_bbox for crops
             if not os.path.exists(start_img_path):
-                save_crop_at_frame(input_path, track['bbox'], track['start_frame'], start_img_path)
+                save_crop_at_frame(input_path, track.get('start_bbox', track['bbox']), track['start_frame'], start_img_path)
             if not os.path.exists(end_img_path):
-                save_crop_at_frame(input_path, track['bbox'], track['last_frame'], end_img_path)
+                save_crop_at_frame(input_path, track.get('end_bbox', track['bbox']), track['last_frame'], end_img_path)
             track['saved'] = True
             image_files.append({
                 "start": start_img_name,
