@@ -11,6 +11,36 @@ from pathlib import Path
 import threading
 from PIL import ImageFont, ImageDraw, Image
 import numpy as np
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+from enum import Enum
+
+# Job management classes
+class JobStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+@dataclass
+class ProcessingJob:
+    job_id: str
+    status: JobStatus = JobStatus.PENDING
+    progress: float = 0.0
+    total_videos: int = 0
+    processed_videos: int = 0
+    results: List[Dict] = field(default_factory=list)
+    error_message: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    completed_at: Optional[float] = None
+    uuid: Optional[str] = None
+    top_color: Optional[str] = None
+    video_files: List[Dict] = field(default_factory=list)  # Store video info for processing
+
+# Global job storage (in production, use Redis or database)
+jobs: Dict[str, ProcessingJob] = {}
+jobs_lock = threading.Lock()
 
 app = Flask(__name__)
 CORS(app)
@@ -37,14 +67,24 @@ ANALYSIS_INTERVAL = 15
 IOU_THRESHOLD = 0.3
 MAX_MISSED = 3
 
-# Load YOLO model
-try:
-    model = YOLO("yolo11s.pt")  # Download automatically if not present
-    tshirt_model = YOLO("tshirt_detection_model.pt")
-except Exception as e:
-    print(f"Error loading YOLO model: {e}")
-    model = None
-    tshirt_model = None
+# Global model variables (lazy loading)
+model = None
+tshirt_model = None
+
+def load_models():
+    """Load YOLO models lazily when needed"""
+    global model, tshirt_model
+    if model is None:
+        try:
+            print("Loading YOLO models...")
+            model = YOLO("yolo11s.pt")  # Download automatically if not present
+            tshirt_model = YOLO("tshirt_detection_model.pt")
+            print("✅ YOLO models loaded successfully")
+        except Exception as e:
+            print(f"❌ Error loading YOLO model: {e}")
+            model = None
+            tshirt_model = None
+    return model is not None and tshirt_model is not None
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -85,8 +125,8 @@ def save_crop_at_frame(video_path, bbox, frame_num, output_path):
 
 def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None, original_filename=None):
     """Process video with YOLO detection and save with bounding boxes using two-stage detection pipeline"""
-    if model is None or tshirt_model is None:
-        raise Exception("YOLO or t-shirt model not loaded")
+    if not load_models():
+        raise Exception("Failed to load YOLO models")
 
     cap = cv2.VideoCapture(input_path)
 
@@ -131,7 +171,7 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
             last_detections.clear()
 
             # Stage 1: Detect persons in the frame
-            results = model(frame)
+            results = model(frame) # type: ignore
             boxes = results[0].boxes
 
             if boxes is not None and len(boxes) > 0:
@@ -170,7 +210,7 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
                         continue
 
                     # Stage 2: Detect t-shirt in the ROI
-                    tshirt_results = tshirt_model(roi)
+                    tshirt_results = tshirt_model(roi) # type: ignore
                     tshirt_boxes = tshirt_results[0].boxes
 
                     if tshirt_boxes is not None and len(tshirt_boxes) > 0:
@@ -195,7 +235,7 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
 
                             # Get confidence and label
                             conf = float(tshirt_box.conf[0]) if hasattr(tshirt_box, "conf") else 0.0
-                            label = tshirt_model.names[int(tshirt_box.cls[0])] if hasattr(tshirt_box, "cls") else "tshirt"
+                            label = tshirt_model.names[int(tshirt_box.cls[0])] if hasattr(tshirt_box, "cls") else "tshirt" # type: ignore
 
                             if label.lower() == chosen_color.lower():
                                 detections_for_matching.append((abs_x1, abs_y1, abs_x2, abs_y2, label, conf))
@@ -347,8 +387,8 @@ def process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=None
 
 
 @app.route("/upload", methods=["POST"])
-def upload_videos():
-    """Upload and process multiple videos"""
+def submit_job():
+    """Submit videos for async processing and return job ID immediately"""
     if "videos" not in request.files:
         return jsonify({"error": "No videos provided"}), 400
 
@@ -362,59 +402,166 @@ def upload_videos():
         return jsonify({"error": "topColor not provided"}), 400
 
     files = request.files.getlist("videos")
-    threads = []
-    results = []
-
-    def process_file(file, uuid_str, original_filename, input_path, output_path, chosen_color):
-        try:
-            # Save uploaded file
-            file.save(input_path)
-
-            # Process with YOLO
-            image_files = process_video_with_yolo(input_path, output_path, chosen_color, uuid_str=uuid_str, original_filename=original_filename)
-
-            results.append(
-                {
-                    "original_name": original_filename,
-                    "processed_id": uuid_str,
-                    "processed_filename": os.path.basename(output_path),
-                    "images": image_files,
-                }
-            )
-
-            # Clean up input file
-            os.remove(input_path)
-
-        except Exception as e:
-            results.append({"error": f"Error processing {file.filename}: {str(e)}"})
-
+    valid_files = []
+    
+    # Generate job ID and create job
+    job_id = str(uuid.uuid4())
+    
+    # Save uploaded files and prepare job data
     for file in files:
         if file and file.filename and allowed_file(file.filename):
             original_filename = secure_filename(file.filename)
             input_filename = f"{request_uuid}_{original_filename}"
-            output_filename = f"processed_{request_uuid}_{original_filename}"
-
             input_path = os.path.join(UPLOAD_FOLDER, input_filename)
+            output_filename = f"processed_{request_uuid}_{original_filename}"
             output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+            
+            # Save the uploaded file
+            file.save(input_path)
+            
+            valid_files.append({
+                "original_filename": original_filename,
+                "input_path": input_path,
+                "output_path": output_path
+            })
+    
+    if not valid_files:
+        return jsonify({"error": "No valid video files found"}), 400
+    
+    # Create and store job
+    with jobs_lock:
+        job = ProcessingJob(
+            job_id=job_id,
+            total_videos=len(valid_files),
+            uuid=request_uuid,
+            top_color=top_color,
+            video_files=valid_files
+        )
+        jobs[job_id] = job
+    
+    # Start background processing
+    processing_thread = threading.Thread(target=process_job_async, args=(job_id,))
+    processing_thread.daemon = True
+    processing_thread.start()
+    
+    return jsonify({
+        "job_id": job_id,
+        "status": "submitted",
+        "total_videos": len(valid_files)
+    })
 
-            t = threading.Thread(target=process_file, args=(file, request_uuid, original_filename, input_path, output_path, top_color))
-            t.start()
-            threads.append(t)
+def process_job_async(job_id: str):
+    """Process a job asynchronously in the background"""
+    with jobs_lock:
+        if job_id not in jobs:
+            return
+        job = jobs[job_id]
+        job.status = JobStatus.PROCESSING
+    
+    try:
+        for i, video_info in enumerate(job.video_files):
+            original_filename = video_info["original_filename"]
+            input_path = video_info["input_path"]
+            output_path = video_info["output_path"]
+            
+            try:
+                # Process with YOLO
+                image_files = process_video_with_yolo(
+                    input_path, output_path, job.top_color, 
+                    uuid_str=job.uuid, original_filename=original_filename
+                )
+                
+                result = {
+                    "original_name": original_filename,
+                    "processed_id": job.uuid,
+                    "processed_filename": os.path.basename(output_path),
+                    "images": image_files,
+                }
+                
+                with jobs_lock:
+                    job.results.append(result)
+                    job.processed_videos += 1
+                    job.progress = job.processed_videos / job.total_videos
+                
+                # Clean up input file
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+                    
+            except Exception as e:
+                error_result = {"error": f"Error processing {original_filename}: {str(e)}"}
+                with jobs_lock:
+                    job.results.append(error_result)
+                    job.processed_videos += 1
+                    job.progress = job.processed_videos / job.total_videos
+                
+                print(f"Error processing {original_filename}: {e}")
+        
+        # Mark job as completed
+        with jobs_lock:
+            job.status = JobStatus.COMPLETED
+            job.completed_at = time.time()
+            
+    except Exception as e:
+        print(f"Fatal error processing job {job_id}: {e}")
+        with jobs_lock:
+            job.status = JobStatus.FAILED
+            job.error_message = str(e)
+            job.completed_at = time.time()
 
-    for t in threads:
-        t.join()
+@app.route("/job/<job_id>/status", methods=["GET"])
+def get_job_status(job_id: str):
+    """Get the current status of a processing job"""
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Job not found"}), 404
+        
+        job = jobs[job_id]
+        return jsonify({
+            "job_id": job_id,
+            "status": job.status.value,
+            "progress": job.progress,
+            "total_videos": job.total_videos,
+            "processed_videos": job.processed_videos,
+            "error_message": job.error_message,
+            "created_at": job.created_at,
+            "completed_at": job.completed_at
+        })
 
-    return jsonify(
-        {"message": "Videos processed successfully", "processed_files": results}
-    )
+@app.route("/job/<job_id>/results", methods=["GET"])
+def get_job_results(job_id: str):
+    """Get the results of a completed job"""
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Job not found"}), 404
+        
+        job = jobs[job_id]
+        
+        if job.status != JobStatus.COMPLETED:
+            return jsonify({
+                "error": "Job not completed yet",
+                "status": job.status.value
+            }), 400
+        
+        return jsonify({
+            "message": "Videos processed successfully",
+            "processed_files": job.results,
+            "job_id": job_id,
+            "completed_at": job.completed_at
+        })
 
 @app.route("/health")
 def health_check():
     """Health check endpoint"""
-    model_status = "loaded" if model is not None else "not loaded"
-    return jsonify({"status": "healthy", "yolo_model": model_status})
+    model_status = "loaded" if model is not None else "not loaded (lazy loading)"
+    with jobs_lock:
+        active_jobs = len([j for j in jobs.values() if j.status in [JobStatus.PENDING, JobStatus.PROCESSING]])
+    return jsonify({
+        "status": "healthy", 
+        "yolo_model": model_status,
+        "active_jobs": active_jobs
+    })
 
 if __name__ == "__main__":
     print("Starting Flask server...")
-    print(f"YOLO model status: {'Loaded' if model else 'Failed to load'}")
-    app.run(debug=True, host="0.0.0.0", port=PORT)
+    print("YOLO models will be loaded lazily when first needed")
+    app.run(debug=False, host="0.0.0.0", port=PORT)
