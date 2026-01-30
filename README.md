@@ -7,6 +7,7 @@ TelusurServer is a Flask-based Python backend that powers the Telusur macOS appl
 ## 🎯 Overview
 
 This server processes video footage to detect and track individuals based on their top clothing color. It employs a two-stage detection pipeline:
+
 1. **Person Detection**: Uses YOLOv11 to detect people in video frames
 2. **T-shirt Color Classification**: Uses a custom trained YOLO model to identify clothing colors (black, blue, grey, white)
 
@@ -26,7 +27,7 @@ The system tracks detected individuals across frames, extracts key frames showin
 
 - **Framework**: Flask with CORS support
 - **Computer Vision**: OpenCV, Ultralytics YOLO
-- **Deep Learning**: YOLOv11 for person detection, custom YOLO model for clothing classification
+- **Deep Learning**: YOLOv11 for person detection, custom YOLO model for clothing classification by Abdul Rehman: [Link](https://github.com/AbdulRehman-git/real-time-tshirt-color-detection-yolov8)
 - **Image Processing**: Pillow (PIL) for text rendering
 - **Concurrency**: Threading for async job processing
 
@@ -54,6 +55,7 @@ pip install -r requirements.txt
 ```
 
 This will install all required packages including:
+
 - Flask and flask-cors
 - OpenCV (opencv-python)
 - Ultralytics YOLO
@@ -63,6 +65,7 @@ This will install all required packages including:
 ### 3. Required Model Files
 
 Ensure these model files are in the project root:
+
 - `yolo11s.pt` - YOLOv11 model for person detection
 - `tshirt_detection_model.pt` - Custom trained model for t-shirt color classification
 
@@ -95,21 +98,27 @@ This simulates a complete workflow: uploading a video, tracking job status, and 
 ## 📡 API Endpoints
 
 ### Health Check
+
 ```
 GET /health
 ```
+
 Returns server status and model loading state.
 
 ### Submit Video Processing Job
+
 ```
 POST /upload
 ```
+
 **Form Data:**
+
 - `videos`: Video file(s) (mp4, avi, mov, mkv)
 - `uuid`: Unique identifier for this analysis session
 - `topColor`: Target clothing color (black, blue, grey, white)
 
 **Response:**
+
 ```json
 {
   "job_id": "uuid-string",
@@ -119,10 +128,13 @@ POST /upload
 ```
 
 ### Check Job Status
+
 ```
 GET /job/<job_id>/status
 ```
+
 **Response:**
+
 ```json
 {
   "job_id": "uuid-string",
@@ -134,9 +146,11 @@ GET /job/<job_id>/status
 ```
 
 ### Get Job Results
+
 ```
 GET /job/<job_id>/results
 ```
+
 Returns processed video information and cropped images once job is completed.
 
 ## ⚙️ Configuration
@@ -149,6 +163,7 @@ Key parameters in `app.py`:
 - `PORT = 4789`: Server port
 
 Output directories (created automatically in `~/Library/Application Support/Telusur/`):
+
 - `Uploads/`: Temporary storage for uploaded videos
 - `Processed/`: Processed videos with bounding boxes
 - `Images/`: Cropped images of detected individuals
@@ -179,6 +194,7 @@ TelusurServer/
 ## 🤝 Integration with Telusur macOS App
 
 This server is designed to work seamlessly with the Telusur SwiftUI macOS application. The macOS app:
+
 1. Uploads CCTV footage via the `/upload` endpoint
 2. Polls `/job/<job_id>/status` for progress updates
 3. Retrieves processed results from `/job/<job_id>/results`
