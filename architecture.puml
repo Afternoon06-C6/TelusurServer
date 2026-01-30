@@ -1,0 +1,231 @@
+@startuml Telusur Architecture
+
+!define ICONURL https://raw.githubusercontent.com/tupadr3/plantuml-icon-font-sprites/v2.4.0
+!include ICONURL/common.puml
+!include ICONURL/font-awesome-5/video.puml
+!include ICONURL/font-awesome-5/server.puml
+!include ICONURL/font-awesome-5/database.puml
+
+title Telusur - CCTV Footage Analysis System\nFrontend-Backend Communication Flow
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+skinparam BoxPadding 20
+
+actor "User" as user #LightBlue
+box "SwiftUI macOS Frontend" #E8F5E9
+    participant "Telusur App\n(Swift UI)" as frontend #81C784
+end box
+
+box "TelusurServer (Python Flask)" #E3F2FD
+    participant "Flask API\n:4789" as api #42A5F5
+    participant "Job Manager\n(Threading)" as jobmgr #1E88E5
+    participant "Video Processor\n(YOLO Pipeline)" as processor #1565C0
+end box
+
+box "AI Models" #FFF3E0
+    participant "YOLOv11\n(Person Detection)" as yolo1 #FFB74D
+    participant "Custom YOLO\n(T-shirt Color)" as yolo2 #FF9800
+end box
+
+box "File System" #F3E5F5
+    database "~/Library/Application Support/Telusur/\n- Uploads/\n- Processed/\n- Images/" as storage #AB47BC
+end box
+
+== 1. Initial Health Check ==
+frontend -> api: GET /health
+activate api
+api --> frontend: {"status": "healthy",\n"yolo_model": "not loaded",\n"active_jobs": 0}
+deactivate api
+
+note right of frontend
+  User selects:
+  - CCTV video file(s)
+  - Target clothing color
+  - (black/blue/grey/white)
+end note
+
+== 2. Video Upload & Job Submission ==
+user -> frontend: Select video & color
+activate frontend
+frontend -> api: POST /upload\n- videos: [video files]\n- uuid: "session-123"\n- topColor: "blue"
+activate api
+
+api -> storage: Save video to Uploads/
+activate storage
+storage --> api: video saved
+deactivate storage
+
+api -> jobmgr: Create ProcessingJob\n- job_id: uuid\n- status: PENDING\n- video_files info
+activate jobmgr
+
+jobmgr -> jobmgr: Store job in memory\n(jobs dictionary)
+
+api --> frontend: {"job_id": "abc-123",\n"status": "submitted",\n"total_videos": 1}
+deactivate api
+
+note right of jobmgr
+  Job stored with:
+  - job_id
+  - uuid
+  - topColor
+  - video_files paths
+  - status: PENDING
+end note
+
+jobmgr -> processor: Start background thread\nprocess_job_async(job_id)
+activate processor
+jobmgr -> jobmgr: Update status:\nPROCESSING
+deactivate jobmgr
+
+== 3. Status Polling (Async) ==
+frontend -> api: GET /job/abc-123/status
+activate api
+api -> jobmgr: Check job status
+activate jobmgr
+jobmgr --> api: {"status": "processing",\n"progress": 0.0,\n"processed_videos": 0}
+deactivate jobmgr
+api --> frontend: Status response
+deactivate api
+
+note left of frontend
+  Frontend polls every
+  2-3 seconds to show
+  progress to user
+end note
+
+== 4. Video Processing Pipeline ==
+
+processor -> processor: Load video with OpenCV
+processor -> yolo1: Initialize YOLOv11 model
+activate yolo1
+yolo1 --> processor: Model ready
+deactivate yolo1
+
+processor -> yolo2: Initialize T-shirt model
+activate yolo2
+yolo2 --> processor: Model ready
+deactivate yolo2
+
+loop Every ANALYSIS_INTERVAL frames (e.g., every 15th frame)
+    processor -> processor: Read frame from video
+    
+    processor -> yolo1: Detect persons in frame
+    activate yolo1
+    yolo1 --> processor: Person bounding boxes
+    deactivate yolo1
+    
+    loop For each detected person
+        processor -> processor: Extract person ROI\n(Region of Interest)
+        
+        processor -> yolo2: Detect t-shirt color in ROI
+        activate yolo2
+        yolo2 --> processor: Color classification\n(black/blue/grey/white)
+        deactivate yolo2
+        
+        alt Color matches target color
+            processor -> processor: Convert ROI coords\nto absolute frame coords
+            processor -> processor: Track person using IoU\n(Intersection over Union)
+            
+            alt Matches existing track
+                processor -> processor: Update track:\n- bbox\n- last_frame\n- end_bbox\n- reset missed counter
+            else New person
+                processor -> processor: Create new track:\n- assign track_id\n- store start_bbox\n- store start_frame
+            end
+        end
+    end
+    
+    processor -> processor: Age unmatched tracks\n(increment missed counter)
+    
+    loop For tracks with missed > MAX_MISSED
+        processor -> processor: Extract start frame crop
+        processor -> storage: Save start frame image
+        activate storage
+        storage --> processor: Image saved
+        deactivate storage
+        
+        processor -> processor: Extract end frame crop
+        processor -> storage: Save end frame image
+        activate storage
+        storage --> processor: Image saved
+        deactivate storage
+        
+        processor -> processor: Move to finished_tracks
+        processor -> processor: Remove from active_tracks
+    end
+    
+    processor -> processor: Annotate frame:\n- Draw bounding boxes\n- Add labels with SF Pro font\n- Color-code by target color
+    
+    processor -> processor: Write annotated frame\nto output video
+    
+    processor -> jobmgr: Update progress\n(processed_videos / total_videos)
+    activate jobmgr
+    deactivate jobmgr
+end
+
+processor -> processor: Finalize remaining tracks
+processor -> storage: Save processed video\nto Processed/
+activate storage
+storage --> processor: Video saved
+deactivate storage
+
+processor -> storage: Delete uploaded video\nfrom Uploads/
+activate storage
+storage --> processor: Video deleted
+deactivate storage
+
+processor -> jobmgr: Update job:\n- status: COMPLETED\n- results with images\n- completed_at timestamp
+activate jobmgr
+deactivate jobmgr
+deactivate processor
+
+== 5. Continued Status Polling ==
+frontend -> api: GET /job/abc-123/status
+activate api
+api -> jobmgr: Check job status
+activate jobmgr
+jobmgr --> api: {"status": "completed",\n"progress": 1.0,\n"processed_videos": 1}
+deactivate jobmgr
+api --> frontend: Status response
+deactivate api
+
+== 6. Retrieve Results ==
+frontend -> api: GET /job/abc-123/results
+activate api
+api -> jobmgr: Get job results
+activate jobmgr
+jobmgr --> api: {"message": "Videos processed",\n"processed_files": [\n  {"original_name": "video1.mp4",\n   "processed_filename": "...",\n   "images": [\n     {"start": "img1_start.jpg",\n      "end": "img1_end.jpg",\n      "start_time": 2.5,\n      "end_time": 8.3}\n   ]}\n]}
+deactivate jobmgr
+api --> frontend: Complete results
+deactivate api
+
+== 7. Display Results ==
+frontend -> storage: Fetch processed video
+activate storage
+storage --> frontend: Video file
+deactivate storage
+
+frontend -> storage: Fetch cropped images
+activate storage
+storage --> frontend: Image files
+deactivate storage
+
+frontend -> user: Display:\n- Annotated video\n- Detected individuals\n- Timestamps\n- Cropped images
+deactivate frontend
+
+note over user, storage
+  **Key Detection Parameters:**
+  - ANALYSIS_INTERVAL = 15 (process every 15th frame)
+  - IOU_THRESHOLD = 0.3 (tracking sensitivity)
+  - MAX_MISSED = 3 (track persistence)
+  
+  **Supported Colors:**
+  - black, blue, grey, white
+  
+  **Output:**
+  - Processed video with bounding boxes
+  - Start/end frame crops for each detection
+  - Timestamps for when person appeared/disappeared
+end note
+
+@enduml
